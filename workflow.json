@@ -1,0 +1,284 @@
+{
+  "name": "GoHighLevel (GHL) -> n8n Lead Triage & Follow-Up Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ghl-new-lead",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "webhook-ghl-lead",
+      "name": "GHL New Lead Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const payload = $input.first().json.body || $input.first().json;\nconst email = (payload.email || '').trim().toLowerCase();\nconst phone = (payload.phone || '').replace(/[^\\d+]/g, '');\nconst contactId = payload.contact_id || payload.id || '';\n\nif (!contactId && !email && !phone) {\n  throw new Error('Missing lead identifier (contact_id, email, or phone)');\n}\n\nconst budget = Number(payload.customData?.budget || payload.budget || 0);\nconst urgency = String(payload.customData?.urgency || payload.urgency || '').toLowerCase();\n\nlet tier = 'COLD';\nif (budget >= 2000 || urgency.includes('asap') || urgency.includes('today')) {\n  tier = 'HOT';\n} else if (budget >= 500 || urgency.includes('week')) {\n  tier = 'WARM';\n}\n\nreturn [{\n  json: {\n    contactId,\n    fullName: payload.full_name || `${payload.first_name || ''} ${payload.last_name || ''}`.trim() || 'there',\n    email,\n    phone,\n    source: payload.source || payload.lead_source || 'inbound',\n    tier,\n    dedupeKey: `${contactId || email || phone}`,\n    receivedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "code-validate-triage",
+      "name": "Normalize & Triage Lead (Hot/Warm/Cold)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://services.leadconnectorhq.com/contacts/{{ $json.contactId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "options": {
+          "retry": {
+            "maxTries": 3,
+            "waitBetweenTries": 2000
+          }
+        }
+      },
+      "id": "http-ghl-check-contact",
+      "name": "GHL API v2: Check Existing Tags & Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-not-replied",
+              "leftValue": "={{ ($json.contact?.tags || []).join(',') }}",
+              "rightValue": "replied,booked,dnd,followup-active",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-eligible",
+      "name": "Eligible for Follow-Up? (Dedupe & Stop Guard)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://services.leadconnectorhq.com/contacts/{{ $('Normalize & Triage Lead (Hot/Warm/Cold)').item.json.contactId }}/tags",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tags\": [\n    \"followup-active\",\n    \"tier-{{ $('Normalize & Triage Lead (Hot/Warm/Cold)').item.json.tier.toLowerCase() }}\"\n  ]\n}"
+      },
+      "id": "http-ghl-tag",
+      "name": "GHL API v2: Tag Contact & Enroll",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1220, 220]
+    },
+    {
+      "parameters": {
+        "amount": 15,
+        "unit": "minutes"
+      },
+      "id": "wait-step-1",
+      "name": "Wait 15m Before Step 2 Check",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1460, 220]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=https://services.leadconnectorhq.com/contacts/{{ $('Normalize & Triage Lead (Hot/Warm/Cold)').item.json.contactId }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        }
+      },
+      "id": "http-ghl-recheck",
+      "name": "GHL API v2: Re-Check Stop Conditions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1700, 220]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "stop-if-booked-or-replied",
+              "leftValue": "={{ ($json.contact?.tags || []).some(t => ['replied', 'booked', 'dnd'].includes(t.toLowerCase())) }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "if-still-open",
+      "name": "Still Unreplied & Unbooked?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1940, 220]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/conversations/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"type\": \"SMS\",\n  \"contactId\": \"{{ $('Normalize & Triage Lead (Hot/Warm/Cold)').item.json.contactId }}\",\n  \"message\": \"Hi {{ $('Normalize & Triage Lead (Hot/Warm/Cold)').item.json.fullName }}, just checking in on your request — would you like to grab a quick 10-minute slot today?\"\n}"
+      },
+      "id": "http-ghl-send-followup",
+      "name": "GHL API v2: Send Follow-Up SMS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, 160]
+    }
+  ],
+  "connections": {
+    "GHL New Lead Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize & Triage Lead (Hot/Warm/Cold)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize & Triage Lead (Hot/Warm/Cold)": {
+      "main": [
+        [
+          {
+            "node": "GHL API v2: Check Existing Tags & Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL API v2: Check Existing Tags & Status": {
+      "main": [
+        [
+          {
+            "node": "Eligible for Follow-Up? (Dedupe & Stop Guard)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Eligible for Follow-Up? (Dedupe & Stop Guard)": {
+      "main": [
+        [
+          {
+            "node": "GHL API v2: Tag Contact & Enroll",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL API v2: Tag Contact & Enroll": {
+      "main": [
+        [
+          {
+            "node": "Wait 15m Before Step 2 Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 15m Before Step 2 Check": {
+      "main": [
+        [
+          {
+            "node": "GHL API v2: Re-Check Stop Conditions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL API v2: Re-Check Stop Conditions": {
+      "main": [
+        [
+          {
+            "node": "Still Unreplied & Unbooked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still Unreplied & Unbooked?": {
+      "main": [
+        [
+          {
+            "node": "GHL API v2: Send Follow-Up SMS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true
+  }
+}
